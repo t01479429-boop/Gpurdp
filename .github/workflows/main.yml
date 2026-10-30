@@ -1,0 +1,264 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT="windows-gaming-vm"
+
+mkdir -p "$PROJECT/.github/workflows"
+cd "$PROJECT"
+
+# Terraform configuration
+cat > main.tf <<'EOF'
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  backend "s3" {}
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+data "aws_ami" "windows2025" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name = "name"
+    values = ["Windows_Server-2025-English-Full-Base-*"]
+  }
+
+  filter {
+    name = "architecture"
+    values = ["x86_64"]
+  }
+}
+
+resource "aws_security_group" "gaming" {
+  name = "windows-gaming-security"
+
+  ingress {
+    description = "RDP restricted to your IP"
+    from_port = 3389
+    to_port = 3389
+    protocol = "tcp"
+    cidr_blocks = [var.my_ip_cidr]
+  }
+
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_iam_role" "ssm" {
+  name = "windows-gaming-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role = aws_iam_role.ssm.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ssm" {
+  name = "windows-gaming-profile"
+  role = aws_iam_role.ssm.name
+}
+
+resource "aws_instance" "gaming" {
+  ami = data.aws_ami.windows2025.id
+  instance_type = "g4dn.2xlarge"
+
+  key_name = var.key_pair_name
+  vpc_security_group_ids = [aws_security_group.gaming.id]
+  iam_instance_profile = aws_iam_instance_profile.ssm.name
+
+  root_block_device {
+    volume_size = 300
+    volume_type = "gp3"
+    encrypted = true
+    delete_on_termination = true
+  }
+
+  user_data = <<-POWERSHELL
+    <powershell>
+    powercfg /setactive SCHEME_MIN
+
+    Set-ItemProperty `
+      -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+      -Name fDenyTSConnections -Value 0
+
+    Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+    Set-Service -Name TermService -StartupType Automatic
+    Start-Service -Name TermService
+
+    New-Item -ItemType Directory -Path C:\Gaming -Force
+
+    Set-ExecutionPolicy RemoteSigned -Force
+    </powershell>
+  POWERSHELL
+
+  tags = {
+    Name = "Windows-Server-2025-Gaming"
+    GPU = "NVIDIA-T4"
+    ManagedBy = "Terraform"
+  }
+}
+
+output "public_ip" {
+  value = aws_instance.gaming.public_ip
+}
+
+output "instance_id" {
+  value = aws_instance.gaming.id
+}
+EOF
+
+# Variables
+cat > variables.tf <<'EOF'
+variable "aws_region" {
+  type = string
+  default = "us-east-1"
+}
+
+variable "key_pair_name" {
+  type = string
+}
+
+variable "my_ip_cidr" {
+  type = string
+}
+EOF
+
+# GitHub Actions
+cat > .github/workflows/deploy.yml <<'EOF'
+name: Windows Gaming VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: VM operation
+        required: true
+        type: choice
+        options:
+          - create
+          - destroy
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: AWS authentication
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Terraform setup
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Initialize
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=gaming-vm/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="use_lockfile=true"
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Create VM
+        if: inputs.action == 'create'
+        env:
+          TF_VAR_key_pair_name: ${{ secrets.EC2_KEY_PAIR }}
+          TF_VAR_my_ip_cidr: ${{ secrets.MY_IP_CIDR }}
+        run: |
+          terraform apply -auto-approve
+          terraform output
+
+      - name: Destroy VM
+        if: inputs.action == 'destroy'
+        run: terraform destroy -auto-approve
+EOF
+
+# README
+cat > README.md <<'EOF'
+# Windows Server 2025 Gaming VM
+
+## Target configuration
+
+- OS: Windows Server 2025
+- Instance: AWS EC2 g4dn.2xlarge
+- GPU: NVIDIA T4 16GB
+- CPU: Intel Xeon Platinum 8259CL
+- RAM: 32GB
+- Storage: 300GB gp3 SSD
+- Remote access: RDP
+
+## Requirements
+
+- AWS account
+- AWS IAM role configured for GitHub OIDC
+- Existing S3 bucket for Terraform state
+- Existing EC2 key pair
+
+## GitHub repository secrets
+
+AWS_ROLE_ARN
+TF_STATE_BUCKET
+EC2_KEY_PAIR
+MY_IP_CIDR
+
+## Deployment
+
+1. Configure the AWS role and GitHub secrets.
+2. Open Actions.
+3. Select Windows Gaming VM.
+4. Select Run workflow.
+5. Select create.
+
+To delete the VM, select destroy.
+EOF
+
+echo ""
+echo "======================================"
+echo " Windows Gaming VM project generated"
+echo "======================================"
+echo ""
+echo "Project: $PROJECT"
+echo ""
+echo "Files:"
+find . -type f
+echo ""
+echo "Next: configure AWS and GitHub secrets."
